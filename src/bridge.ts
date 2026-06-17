@@ -48,6 +48,15 @@ declare global {
   }
 }
 
+interface IAnalyticsManager {
+  initialize(gameId: string, sessionName: string): void;
+  startLevel(levelId: string): void;
+  endLevel(levelId: string, successful: boolean, timeTaken: number, xpEarned: number): void;
+  recordTask(levelId: string, taskId: string, question: string, correctChoice: string, choiceMade: string, timeTaken: number, xpEarned: number): void;
+  addRawMetric(key: string, value: unknown): void;
+  submitReport(): void;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STORAGE_KEY = 'snakejam_progress';
@@ -166,7 +175,10 @@ export function saveProgress(
 
 /**
  * Sends an analytics event to the React Native host (if available),
- * and also logs to console for browser testing.
+ * and also drives the AnalyticsManager session report.
+ *
+ * NOTE: AnalyticsManager is loaded as a UMD global via a <script> tag
+ * before this module runs. Accessed through window to survive tree-shaking.
  */
 export function sendAnalytics(
   event: AnalyticsEvent,
@@ -181,6 +193,55 @@ export function sendAnalytics(
   };
 
   console.log(`[Analytics] ${event}`, payload);
+
+  // Resolve AnalyticsManager lazily from window (loaded by external UMD script)
+  const win = window as Window & {
+    AnalyticsManager?: new () => IAnalyticsManager;
+    __snakejamAM?: IAnalyticsManager;
+    __snakejamLevelStart?: number;
+  };
+
+  if (!win.__snakejamAM && win.AnalyticsManager) {
+    win.__snakejamAM = new win.AnalyticsManager();
+  }
+  const am = win.__snakejamAM ?? null;
+
+  if (event === 'game_start') {
+    if (am) am.initialize('snakejam', 'session_' + Date.now());
+    win.__snakejamLevelStart = Date.now();
+  }
+
+  if (event === 'level_start') {
+    if (am) am.startLevel('level_' + level);
+    win.__snakejamLevelStart = Date.now();
+  }
+
+  if (event === 'level_complete') {
+    if (am) {
+      const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
+      const livesLeft = typeof extra.livesRemaining === 'number' ? extra.livesRemaining : 3;
+      const xpEarned = 30 + livesLeft * 10;
+      am.endLevel('level_' + level, true, timeTaken, xpEarned);
+      am.submitReport();
+    }
+  }
+
+  if (event === 'level_fail') {
+    if (am) {
+      const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
+      am.endLevel('level_' + level, false, timeTaken, 0);
+      am.submitReport();
+    }
+  }
+
+  if (event === 'game_over') {
+    if (am) {
+      const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
+      am.endLevel('level_' + level, false, timeTaken, 0);
+      am.addRawMetric('game_over', true);
+      am.submitReport();
+    }
+  }
 
   try {
     if (window.ReactNativeWebView) {
