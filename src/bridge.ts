@@ -2,20 +2,31 @@
  * Progress Bridge + Analytics Bridge
  *
  * Handles:
- *  1. Reading window.userInfo injected by a React Native WebView
- *  2. Remapping PascalCase keys (UserID / GameID) → camelCase (userId / gameId)
+ *  1. Reading window.BACKEND_PAYLOAD (blackhole-style) or window.userInfo (legacy)
+ *  2. Remapping PascalCase keys (UserID / GameID) -> camelCase (userId / gameId)
  *  3. Persisting progress to localStorage as a fallback
  *  4. Sending analytics events back to the React Native host
+ *  5. Posting PROGRESS_UPDATE back to ReactNativeWebView on save
  */
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
-/** Shape injected by the React Native WebView */
+/** Shape injected by the React Native WebView via window.userInfo */
 interface RNUserInfo {
   UserID?: string;
   GameID?: string;
   Name?: string;
   highestLevelPlayed?: number;
+}
+
+/** Shape injected by the React Native WebView via window.BACKEND_PAYLOAD (blackhole-style) */
+interface BackendPayloadRaw {
+  userId?: string;
+  gameId?: string;
+  highestLevelPlayed?: number;
+  totalXp?: number;
+  totalPlayTime?: number;
+  sessionsCount?: number;
 }
 
 /** Internal normalised payload used by the bridge */
@@ -39,11 +50,12 @@ interface AnalyticsPayload {
   [key: string]: unknown;
 }
 
-// ─── Extend Window ────────────────────────────────────────────────────────────
+// --- Extend Window -----------------------------------------------------------
 
 declare global {
   interface Window {
     userInfo?: RNUserInfo;
+    BACKEND_PAYLOAD?: BackendPayloadRaw;
     ReactNativeWebView?: { postMessage: (msg: string) => void };
   }
 }
@@ -57,12 +69,28 @@ interface IAnalyticsManager {
   submitReport(): void;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// --- Constants ---------------------------------------------------------------
 
 const STORAGE_KEY = 'snakejam_progress';
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers -----------------------------------------------------------------
 
+/** Read window.BACKEND_PAYLOAD (blackhole-style injection) */
+function readBackendPayload(): BackendPayload | null {
+  try {
+    const bp = window.BACKEND_PAYLOAD;
+    if (!bp || !bp.userId || !bp.gameId) return null;
+    return {
+      userId: bp.userId,
+      gameId: bp.gameId,
+      highestLevelPlayed: typeof bp.highestLevelPlayed === 'number' ? bp.highestLevelPlayed : 1,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Read window.userInfo (legacy RN injection) */
 function readUserInfo(): RNUserInfo | null {
   try {
     return window.userInfo ?? null;
@@ -110,7 +138,7 @@ function saveToStorage(payload: BackendPayload): void {
   }
 }
 
-// ─── Progress Bridge ──────────────────────────────────────────────────────────
+// --- Progress Bridge ---------------------------------------------------------
 
 interface ProgressResult {
   /** 0-indexed level the game should start at */
@@ -121,29 +149,40 @@ interface ProgressResult {
 
 /**
  * Resolves the starting level.
- * Priority: window.userInfo → localStorage → default (level 1 → index 0)
+ * Priority: window.BACKEND_PAYLOAD -> window.userInfo -> localStorage -> default
  */
 export function resolveProgress(): ProgressResult {
-  const userInfo = readUserInfo();
+  // Priority 1: window.BACKEND_PAYLOAD (blackhole-style injection)
+  const backendPayload = readBackendPayload();
+  if (backendPayload) {
+    const startLevelIndex = Math.max(0, backendPayload.highestLevelPlayed - 1);
+    console.log(
+      '[ProgressBridge] BACKEND_PAYLOAD — starting at level ' + backendPayload.highestLevelPlayed + ' (index ' + startLevelIndex + ')',
+    );
+    saveToStorage(backendPayload);
+    return { startLevelIndex, payload: backendPayload, source: 'webview' };
+  }
 
+  // Priority 2: window.userInfo (legacy RN injection)
+  const userInfo = readUserInfo();
   if (userInfo) {
     const payload = remapToBackendPayload(userInfo);
     if (payload) {
-      // highestLevelPlayed is 1-indexed; convert to 0-indexed start
       const startLevelIndex = Math.max(0, payload.highestLevelPlayed - 1);
       console.log(
-        `[ProgressBridge] WebView injection — starting at level ${payload.highestLevelPlayed} (index ${startLevelIndex})`,
+        '[ProgressBridge] WebView userInfo — starting at level ' + payload.highestLevelPlayed + ' (index ' + startLevelIndex + ')',
       );
-      saveToStorage(payload); // keep localStorage in sync
+      saveToStorage(payload);
       return { startLevelIndex, payload, source: 'webview' };
     }
   }
 
+  // Priority 3: localStorage fallback
   const stored = loadFromStorage();
   if (stored) {
     const startLevelIndex = Math.max(0, stored.highestLevelPlayed - 1);
     console.log(
-      `[ProgressBridge] localStorage — starting at level ${stored.highestLevelPlayed} (index ${startLevelIndex})`,
+      '[ProgressBridge] localStorage — starting at level ' + stored.highestLevelPlayed + ' (index ' + startLevelIndex + ')',
     );
     return { startLevelIndex, payload: stored, source: 'localStorage' };
   }
@@ -153,32 +192,40 @@ export function resolveProgress(): ProgressResult {
 }
 
 /**
- * Persists the highest level reached.
- * Call this whenever the player completes a level.
+ * Persists the highest level reached and notifies React Native host.
  * `levelIndex` is 0-indexed; stored as 1-indexed.
  */
 export function saveProgress(
   levelIndex: number,
   existingPayload: BackendPayload | null,
 ): void {
-  const highestLevelPlayed = levelIndex + 1; // convert to 1-indexed
+  const highestLevelPlayed = levelIndex + 1;
   const payload: BackendPayload = {
     userId: existingPayload?.userId ?? '',
-    gameId: existingPayload?.gameId ?? '',
+    gameId: existingPayload?.gameId ?? 'snakejam',
     highestLevelPlayed,
   };
   saveToStorage(payload);
-  console.log(`[ProgressBridge] Saved progress — highestLevelPlayed: ${highestLevelPlayed}`);
+  console.log('[ProgressBridge] Saved progress — highestLevelPlayed: ' + highestLevelPlayed);
+
+  // Post PROGRESS_UPDATE back to React Native host (matches blackhole pattern)
+  try {
+    if (window.ReactNativeWebView) {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'PROGRESS_UPDATE',
+        payload,
+      }));
+    }
+  } catch {
+    // postMessage unavailable — silent fail
+  }
 }
 
-// ─── Analytics Bridge ─────────────────────────────────────────────────────────
+// --- Analytics Bridge --------------------------------------------------------
 
 /**
  * Sends an analytics event to the React Native host (if available),
  * and also drives the AnalyticsManager session report.
- *
- * NOTE: AnalyticsManager is loaded as a UMD global via a <script> tag
- * before this module runs. Accessed through window to survive tree-shaking.
  */
 export function sendAnalytics(
   event: AnalyticsEvent,
@@ -187,14 +234,13 @@ export function sendAnalytics(
 ): void {
   const payload: AnalyticsPayload = {
     event,
-    level, // 1-indexed display level
+    level,
     ...extra,
     timestamp: Date.now(),
   };
 
-  console.log(`[Analytics] ${event}`, payload);
+  console.log('[Analytics] ' + event, payload);
 
-  // Resolve AnalyticsManager lazily from window (loaded by external UMD script)
   const win = window as Window & {
     AnalyticsManager?: new () => IAnalyticsManager;
     __snakejamAM?: IAnalyticsManager;
