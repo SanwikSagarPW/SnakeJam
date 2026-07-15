@@ -15,6 +15,7 @@ const SVG_W = GRID_W * CELL_SIZE;
 const SVG_H = GRID_H * CELL_SIZE;
 const SEGMENT_DISTANCE = 8; // Smaller distance for smoother tracing
 const POINTS_PER_CELL = 6; 
+const ENABLE_DEV_COMPLETE_SHORTCUT = false;
 
 interface SnakePoint {
   x: number;
@@ -455,7 +456,10 @@ export default function App() {
         setCurrentLevel(prev => {
           // Save prev+1 so next session starts at prev+1 (i.e. the next level)
           saveProgress(prev + 1, progressRef.current.payload);
-          sendAnalytics('level_complete', prev + 1);
+          sendAnalytics('level_complete', prev + 1, {
+            livesRemaining: lives,
+            snakesCleared: prevSnakes.length,
+          });
           // Refresh progressRef so restarts in the same session use the updated level
           progressRef.current = resolveProgress();
           return prev;
@@ -466,7 +470,7 @@ export default function App() {
     });
 
     requestRef.current = requestAnimationFrame(updatePhysics);
-  }, []);
+  }, [lives]);
 
   useEffect(() => {
     requestRef.current = requestAnimationFrame(updatePhysics);
@@ -474,6 +478,35 @@ export default function App() {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
   }, [updatePhysics]);
+
+  useEffect(() => {
+    const win = window as Window & { __completeLevelForTest?: () => void };
+    win.__completeLevelForTest = () => {
+      if (!ENABLE_DEV_COMPLETE_SHORTCUT) {
+        console.log('DEV: Auto-complete ignored because debug shortcut is disabled.');
+        return;
+      }
+
+      setIsLevelComplete(true);
+      sendAnalytics('level_complete', currentLevel + 1, {
+        livesRemaining: lives,
+        snakesCleared: snakes.length,
+      });
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.key && event.key.toLowerCase() === 'c') || event.code === 'KeyC') {
+        event.preventDefault();
+        win.__completeLevelForTest?.();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true);
+      delete win.__completeLevelForTest;
+    };
+  }, [currentLevel, lives, snakes.length]);
 
   const handleSnakeClick = (id: string) => {
     if (isGameOver || isLevelComplete) return;
