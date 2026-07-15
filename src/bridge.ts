@@ -62,16 +62,17 @@ declare global {
 
 interface IAnalyticsManager {
   initialize(gameId: string, sessionName: string): void;
-  startLevel(levelId: string): void;
-  endLevel(levelId: string, successful: boolean, timeTaken: number, xpEarned: number): void;
-  recordTask(levelId: string, taskId: string, question: string, correctChoice: string, choiceMade: string, timeTaken: number, xpEarned: number): void;
+  startLevel(levelId: string | number, options?: { levelNumber?: number }): void;
+  endLevel(levelId: string | number, successful: boolean, timeTaken: number, xpEarned: number): void;
+  recordTask(levelId: string | number, taskId: string, question: string, correctChoice: string, choiceMade: string, timeTaken: number, xpEarned: number): void;
   addRawMetric(key: string, value: unknown): void;
-  submitReport(): void;
+  submitLevel(levelId: string | number, options?: { runId?: string }): unknown;
 }
 
 // --- Constants ---------------------------------------------------------------
 
 const STORAGE_KEY = 'snakejam_progress';
+const SNAKEJAM_LEVEL_XP = 1;
 
 // --- Helpers -----------------------------------------------------------------
 
@@ -135,6 +136,42 @@ function saveToStorage(payload: BackendPayload): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch {
     // storage unavailable — silent fail
+  }
+}
+
+function createRunId(): string {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+
+  return `snakejam_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getSnakeJamRunId(reset = false): string {
+  const win = window as Window & {
+    __snakejamRunId?: string;
+    __snakejamSubmittedLevels?: Set<number>;
+  };
+
+  if (reset || !win.__snakejamRunId) {
+    win.__snakejamRunId = createRunId();
+    win.__snakejamSubmittedLevels = new Set<number>();
+  }
+
+  return win.__snakejamRunId;
+}
+
+function postAnalyticsDebug(event: string, detail: Record<string, unknown> = {}): void {
+  try {
+    window.parent.postMessage({
+      __analyticsDebug: true,
+      game: 'SnakeJam',
+      event,
+      detail,
+      at: new Date().toISOString(),
+    }, '*');
+  } catch {
+    // Debug-only for local launcher visibility.
   }
 }
 
@@ -242,50 +279,89 @@ export function sendAnalytics(
   console.log('[Analytics] ' + event, payload);
 
   const win = window as Window & {
-    AnalyticsManager?: new () => IAnalyticsManager;
+    AnalyticsManager?: {
+      new (): IAnalyticsManager;
+      getInstance?: () => IAnalyticsManager;
+    };
     __snakejamAM?: IAnalyticsManager;
     __snakejamLevelStart?: number;
+    __snakejamSubmittedLevels?: Set<number>;
   };
 
   if (!win.__snakejamAM && win.AnalyticsManager) {
-    win.__snakejamAM = new win.AnalyticsManager();
+    win.__snakejamAM = typeof win.AnalyticsManager.getInstance === 'function'
+      ? win.AnalyticsManager.getInstance()
+      : new win.AnalyticsManager();
   }
   const am = win.__snakejamAM ?? null;
 
   if (event === 'game_start') {
-    if (am) am.initialize('snakejam', 'session_' + Date.now());
+    const runId = getSnakeJamRunId(true);
+    if (am) am.initialize('snakejam', runId);
     win.__snakejamLevelStart = Date.now();
+    postAnalyticsDebug('run_started', { runId, level });
   }
 
   if (event === 'level_start') {
-    if (am) am.startLevel('level_' + level);
+    if (am) {
+      am.startLevel(level, { levelNumber: level });
+      am.addRawMetric(`level_${level}_started_at`, new Date().toISOString());
+    }
     win.__snakejamLevelStart = Date.now();
+    postAnalyticsDebug('level_started', { runId: getSnakeJamRunId(false), levelNumber: level });
   }
 
   if (event === 'level_complete') {
     if (am) {
+      if (win.__snakejamSubmittedLevels?.has(level)) {
+        return;
+      }
+
       const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
       const livesLeft = typeof extra.livesRemaining === 'number' ? extra.livesRemaining : 3;
-      const xpEarned = 30 + livesLeft * 10;
-      am.endLevel('level_' + level, true, timeTaken, xpEarned);
-      am.submitReport();
+      const snakesCleared = typeof extra.snakesCleared === 'number' ? extra.snakesCleared : 0;
+      const blockedTaps = typeof extra.blockedTaps === 'number' ? extra.blockedTaps : 3 - livesLeft;
+      const xpEarned = SNAKEJAM_LEVEL_XP;
+
+      am.addRawMetric(`level_${level}_lives_remaining`, livesLeft);
+      am.addRawMetric(`level_${level}_snakes_cleared`, snakesCleared);
+      am.addRawMetric(`level_${level}_blocked_taps`, blockedTaps);
+      am.addRawMetric(`level_${level}_xp`, SNAKEJAM_LEVEL_XP);
+      am.recordTask(
+        level,
+        `snakejam_level_${level}_clear`,
+        'Clear every snake from the board',
+        'completed',
+        'completed',
+        timeTaken,
+        xpEarned,
+      );
+      am.endLevel(level, true, timeTaken, xpEarned);
+      const payload = am.submitLevel(level, { runId: getSnakeJamRunId(false) });
+      win.__snakejamSubmittedLevels?.add(level);
+      postAnalyticsDebug('submit_success', {
+        runId: getSnakeJamRunId(false),
+        levelNumber: level,
+        xpEarned,
+        livesRemaining: livesLeft,
+        snakesCleared,
+        payload,
+      });
     }
   }
 
   if (event === 'level_fail') {
     if (am) {
-      const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
-      am.endLevel('level_' + level, false, timeTaken, 0);
-      am.submitReport();
+      const livesLeft = typeof extra.livesRemaining === 'number' ? extra.livesRemaining : 0;
+      am.addRawMetric(`level_${level}_failed_tap_lives_remaining`, livesLeft);
+      postAnalyticsDebug('level_fail', { runId: getSnakeJamRunId(false), levelNumber: level, livesRemaining: livesLeft });
     }
   }
 
   if (event === 'game_over') {
     if (am) {
-      const timeTaken = Date.now() - (win.__snakejamLevelStart ?? Date.now());
-      am.endLevel('level_' + level, false, timeTaken, 0);
       am.addRawMetric('game_over', true);
-      am.submitReport();
+      postAnalyticsDebug('game_over', { runId: getSnakeJamRunId(false), levelNumber: level });
     }
   }
 
