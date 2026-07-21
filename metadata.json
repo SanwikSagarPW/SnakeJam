@@ -1,0 +1,5 @@
+{
+  "name": "Remix: Arrows Puzzle",
+  "description": "A puzzle game where you tap arrows to make them fly away, but be careful not to block them!",
+  "requestFramePermissions": []
+}
